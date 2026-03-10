@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
+import { getLocalDateString } from '@/lib/utils';
 
 // Set a temp data dir before importing db module
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codepilot-workspace-test-'));
@@ -59,7 +60,7 @@ describe('Assistant Workspace', () => {
       const state = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
       assert.equal(state.onboardingComplete, false);
       assert.equal(state.lastCheckInDate, null);
-      assert.equal(state.schemaVersion, 2);
+      assert.equal(state.schemaVersion, 3);
     });
 
     it('should create all 4 template files', () => {
@@ -90,7 +91,7 @@ describe('Assistant Workspace', () => {
       initializeWorkspace(workDir);
       const state = loadState(workDir);
       state.onboardingComplete = true;
-      state.lastCheckInDate = new Date().toISOString().slice(0, 10);
+      state.lastCheckInDate = getLocalDateString();
       saveState(workDir, state);
 
       const reloaded = loadState(workDir);
@@ -133,13 +134,13 @@ describe('Assistant Workspace', () => {
     });
 
     it('should not trigger check-in if already done today', () => {
-      const today = new Date().toISOString().slice(0, 10);
+      const today = getLocalDateString();
       const state = { onboardingComplete: true, lastCheckInDate: today, schemaVersion: 2 };
       assert.equal(needsDailyCheckIn(state), false);
     });
 
     it('onboarding day should skip daily check-in (lastCheckInDate set)', () => {
-      const today = new Date().toISOString().slice(0, 10);
+      const today = getLocalDateString();
       const state = { onboardingComplete: true, lastCheckInDate: today, schemaVersion: 2 };
       assert.equal(needsDailyCheckIn(state), false);
     });
@@ -262,20 +263,20 @@ describe('Assistant Workspace', () => {
       migrateStateV1ToV2(workDir);
 
       const state = loadState(workDir);
-      assert.equal(state.schemaVersion, 2);
+      assert.equal(state.schemaVersion, 3);
       assert.ok(fs.existsSync(path.join(workDir, 'memory', 'daily')));
       assert.ok(fs.existsSync(path.join(workDir, 'Inbox')));
     });
 
-    it('should not re-migrate v2 state', () => {
+    it('should not re-migrate v3 state', () => {
       initializeWorkspace(workDir);
       const state = loadState(workDir);
-      assert.equal(state.schemaVersion, 2);
+      assert.equal(state.schemaVersion, 3);
 
       // Should not throw or change anything
       migrateStateV1ToV2(workDir);
       const reloaded = loadState(workDir);
-      assert.equal(reloaded.schemaVersion, 2);
+      assert.equal(reloaded.schemaVersion, 3);
     });
   });
 
@@ -502,6 +503,103 @@ describe('hotset boosts search results', () => {
     assert.ok(results.length >= 2, 'Should find both files');
     // beta.md should be boosted to top due to hotset frequency
     assert.equal(results[0].path, 'beta.md', 'Frequently accessed file should rank higher');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue 1: Onboarding stability fixes
+// ---------------------------------------------------------------------------
+
+describe('completion fence parsing tolerates formatting variations', () => {
+  // These test the regex patterns used in ChatView.tsx for parsing
+  // onboarding-complete and checkin-complete fences.
+
+  const onboardingRegex = /```onboarding-complete\s*\r?\n([\s\S]*?)\r?\n\s*```/;
+  const checkinRegex = /```checkin-complete\s*\r?\n([\s\S]*?)\r?\n\s*```/;
+
+  it('should match standard LF format', () => {
+    const content = '```onboarding-complete\n{"lang":"zh"}\n```';
+    const match = content.match(onboardingRegex);
+    assert.ok(match, 'Should match LF format');
+    assert.equal(JSON.parse(match![1].trim()).lang, 'zh');
+  });
+
+  it('should match CRLF format', () => {
+    const content = '```onboarding-complete\r\n{"lang":"zh"}\r\n```';
+    const match = content.match(onboardingRegex);
+    assert.ok(match, 'Should match CRLF format');
+    assert.equal(JSON.parse(match![1].trim()).lang, 'zh');
+  });
+
+  it('should match with trailing spaces after tag', () => {
+    const content = '```onboarding-complete   \n{"lang":"zh"}\n```';
+    const match = content.match(onboardingRegex);
+    assert.ok(match, 'Should match with trailing spaces');
+  });
+
+  it('should match with leading whitespace before closing fence', () => {
+    const content = '```onboarding-complete\n{"lang":"zh"}\n  ```';
+    const match = content.match(onboardingRegex);
+    assert.ok(match, 'Should match with leading whitespace before closing fence');
+  });
+
+  it('should match checkin-complete with CRLF', () => {
+    const content = '```checkin-complete\r\n{"mood":"good"}\r\n```';
+    const match = content.match(checkinRegex);
+    assert.ok(match, 'Should match checkin CRLF format');
+    assert.equal(JSON.parse(match![1].trim()).mood, 'good');
+  });
+
+  it('should handle JSON with whitespace padding', () => {
+    const content = '```onboarding-complete\n  {"lang":"zh"}  \n```';
+    const match = content.match(onboardingRegex);
+    assert.ok(match, 'Should match');
+    assert.equal(JSON.parse(match![1].trim()).lang, 'zh');
+  });
+});
+
+describe('saveState is atomic (write-then-rename)', () => {
+  let workDir2: string;
+
+  beforeEach(() => {
+    workDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-write-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(workDir2, { recursive: true, force: true });
+  });
+
+  it('should persist onboardingComplete = true reliably', () => {
+    initializeWorkspace(workDir2);
+    const state = loadState(workDir2);
+    state.onboardingComplete = true;
+    state.lastCheckInDate = getLocalDateString();
+    saveState(workDir2, state);
+
+    // Read raw file to verify it's valid JSON
+    const statePath = path.join(workDir2, '.assistant', 'state.json');
+    const raw = fs.readFileSync(statePath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    assert.equal(parsed.onboardingComplete, true);
+  });
+
+  it('should not leave .tmp file after successful write', () => {
+    initializeWorkspace(workDir2);
+    const state = loadState(workDir2);
+    state.onboardingComplete = true;
+    saveState(workDir2, state);
+
+    const tmpPath = path.join(workDir2, '.assistant', 'state.json.tmp');
+    assert.ok(!fs.existsSync(tmpPath), 'Temp file should be removed after atomic rename');
+  });
+
+  it('loadState should return default when state.json is corrupted', () => {
+    const stateDir = path.join(workDir2, '.assistant');
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, 'state.json'), '{corrupted', 'utf-8');
+
+    const state = loadState(workDir2);
+    assert.equal(state.onboardingComplete, false, 'Corrupted state should fall back to default');
   });
 });
 

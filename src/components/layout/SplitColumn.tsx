@@ -95,6 +95,9 @@ export function SplitColumn({ sessionId, isActive, onClose, onFocus }: SplitColu
       setWorkingDirectory(sessionWorkingDir);
       localStorage.setItem("codepilot:last-working-directory", sessionWorkingDir);
       window.dispatchEvent(new Event("refresh-file-tree"));
+    } else {
+      // Clear stale directory from previous column so FileTree doesn't show old project
+      setWorkingDirectory('');
     }
     setSessionId(sessionId);
     setPanelOpen(true);
@@ -113,7 +116,7 @@ export function SplitColumn({ sessionId, isActive, onClose, onFocus }: SplitColu
       <div
         className={cn(
           "flex flex-1 min-w-0 flex-col overflow-hidden rounded-md border-2 transition-colors",
-          isActive ? "border-blue-500" : "border-transparent"
+          isActive ? "border-primary" : "border-transparent"
         )}
         onClick={onFocus}
       >
@@ -129,7 +132,7 @@ export function SplitColumn({ sessionId, isActive, onClose, onFocus }: SplitColu
       <div
         className={cn(
           "flex flex-1 min-w-0 flex-col overflow-hidden rounded-md border-2 transition-colors",
-          isActive ? "border-blue-500" : "border-transparent"
+          isActive ? "border-primary" : "border-transparent"
         )}
         onClick={onFocus}
       >
@@ -144,7 +147,7 @@ export function SplitColumn({ sessionId, isActive, onClose, onFocus }: SplitColu
     <div
       className={cn(
         "flex flex-1 min-w-0 flex-col overflow-hidden rounded-md border-2 transition-colors",
-        isActive ? "border-blue-500" : "border-transparent"
+        isActive ? "border-primary" : "border-transparent"
       )}
       onClick={onFocus}
     >

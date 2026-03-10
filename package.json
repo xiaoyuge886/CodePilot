@@ -1,6 +1,6 @@
 {
   "name": "codepilot",
-  "version": "0.28.1",
+  "version": "0.30.0",
   "private": true,
   "author": {
     "name": "op7418",
@@ -32,8 +32,10 @@
     ]
   },
   "dependencies": {
+    "@ai-sdk/amazon-bedrock": "^4.0.77",
     "@ai-sdk/anthropic": "^3.0.47",
     "@ai-sdk/google": "^3.0.31",
+    "@ai-sdk/google-vertex": "^4.0.80",
     "@ai-sdk/openai": "^3.0.34",
     "@anthropic-ai/claude-agent-sdk": "^0.2.62",
     "@google/genai": "^1.43.0",

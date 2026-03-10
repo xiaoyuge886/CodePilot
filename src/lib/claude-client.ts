@@ -1,6 +1,5 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type {
-  SDKMessage,
   SDKAssistantMessage,
   SDKUserMessage,
   SDKResultMessage,
@@ -12,15 +11,14 @@ import type {
   McpSSEServerConfig,
   McpHttpServerConfig,
   McpServerConfig,
-  NotificationHookInput,
-  PostToolUseHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
-import type { ClaudeStreamOptions, SSEEvent, TokenUsage, MCPServerConfig, PermissionRequestEvent, FileAttachment, ApiProvider } from '@/types';
+import type { ClaudeStreamOptions, SSEEvent, TokenUsage, MCPServerConfig, PermissionRequestEvent, FileAttachment } from '@/types';
 import { isImageFile } from '@/types';
 import { registerPendingPermission } from './permission-registry';
 import { registerConversation, unregisterConversation } from './conversation-registry';
 import { captureCapabilities } from './agent-sdk-capabilities';
-import { getSetting, getActiveProvider, updateSdkSessionId, createPermissionRequest } from './db';
+import { getSetting, updateSdkSessionId, createPermissionRequest } from './db';
+import { resolveForClaudeCode, toClaudeCodeEnv } from './provider-resolver';
 import { findClaudeBinary, findGitBash, getExpandedPath } from './platform';
 import { notifyPermissionRequest, notifyGeneric } from './telegram-bot';
 import os from 'os';
@@ -293,8 +291,14 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
 
   return new ReadableStream<string>({
     async start(controller) {
-      // Hoist activeProvider so it's accessible in the catch block for error messages
-      const activeProvider: ApiProvider | undefined = options.provider ?? getActiveProvider();
+      // Resolve provider via the unified resolver. The caller may pass an explicit
+      // provider (from resolveProvider().provider), or undefined when 'env' mode is
+      // intended. We do NOT fall back to getActiveProvider() here — that's handled
+      // inside resolveForClaudeCode() only when no resolution was attempted at all.
+      const resolved = resolveForClaudeCode(options.provider, {
+        providerId: options.providerId,
+        sessionProviderId: options.sessionProviderId,
+      });
 
       try {
         // Build env for the Claude Code subprocess.
@@ -322,54 +326,15 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
           }
         }
 
-        if (activeProvider && activeProvider.api_key) {
-          // Clear all existing ANTHROPIC_* variables to prevent conflicts
-          for (const key of Object.keys(sdkEnv)) {
-            if (key.startsWith('ANTHROPIC_')) {
-              delete sdkEnv[key];
-            }
-          }
+        // Build env from resolved provider
+        const resolvedEnv = toClaudeCodeEnv(sdkEnv, resolved);
+        // toClaudeCodeEnv returns a full env — merge back into sdkEnv
+        // (preserves HOME, USERPROFILE, PATH, Git Bash detection set above)
+        Object.assign(sdkEnv, resolvedEnv);
 
-          // Inject provider config — set both token variants so extra_env can clear the unwanted one
-          sdkEnv.ANTHROPIC_AUTH_TOKEN = activeProvider.api_key;
-          sdkEnv.ANTHROPIC_API_KEY = activeProvider.api_key;
-          if (activeProvider.base_url) {
-            sdkEnv.ANTHROPIC_BASE_URL = activeProvider.base_url;
-          }
-
-          // Inject extra environment variables
-          // Empty string values mean "delete this variable" (e.g. clear ANTHROPIC_API_KEY for AUTH_TOKEN-only providers)
-          try {
-            const extraEnv = JSON.parse(activeProvider.extra_env || '{}');
-            for (const [key, value] of Object.entries(extraEnv)) {
-              if (typeof value === 'string') {
-                if (value === '') {
-                  delete sdkEnv[key];
-                } else {
-                  sdkEnv[key] = value;
-                }
-              }
-            }
-          } catch {
-            // ignore malformed extra_env
-          }
-        } else {
-          // No active provider — check legacy DB settings first, then fall back to
-          // environment variables already present in process.env (copied into sdkEnv above).
-          // This allows users who set ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL
-          // in their shell environment to use them without configuring a provider in the UI.
-          const appToken = getSetting('anthropic_auth_token');
-          const appBaseUrl = getSetting('anthropic_base_url');
-          if (appToken) {
-            sdkEnv.ANTHROPIC_AUTH_TOKEN = appToken;
-          }
-          if (appBaseUrl) {
-            sdkEnv.ANTHROPIC_BASE_URL = appBaseUrl;
-          }
-          // If neither legacy settings nor env vars provide a key, log a warning
-          if (!appToken && !sdkEnv.ANTHROPIC_API_KEY && !sdkEnv.ANTHROPIC_AUTH_TOKEN) {
-            console.warn('[claude-client] No API key found: no active provider, no legacy settings, and no ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN in environment');
-          }
+        // Warn if no credentials found at all
+        if (!resolved.hasCredentials && !sdkEnv.ANTHROPIC_API_KEY && !sdkEnv.ANTHROPIC_AUTH_TOKEN) {
+          console.warn('[claude-client] No API key found: no active provider, no legacy settings, and no ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN in environment');
         }
 
         // Check if dangerously_skip_permissions is enabled globally or per-session
@@ -389,9 +354,7 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
           // CodePilot, skip 'user' settings because ~/.claude/settings.json
           // may contain env overrides (ANTHROPIC_BASE_URL, ANTHROPIC_MODEL,
           // etc.) that would conflict with the provider's configuration.
-          settingSources: activeProvider?.api_key
-            ? ['project', 'local']
-            : ['user', 'project', 'local'],
+          settingSources: resolved.settingSources as Options['settingSources'],
         };
 
         if (skipPermissions) {
@@ -542,70 +505,11 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
           workingDirectory,
         };
 
-        // Hooks: capture notifications and tool completion events
-        queryOptions.hooks = {
-          Notification: [{
-            hooks: [async (input) => {
-              const notif = input as NotificationHookInput;
-              controller.enqueue(formatSSE({
-                type: 'status',
-                data: JSON.stringify({
-                  notification: true,
-                  title: notif.title,
-                  message: notif.message,
-                }),
-              }));
-              // Forward to Telegram (fire-and-forget)
-              notifyGeneric(notif.title || '', notif.message || '', telegramOpts).catch(() => {});
-              return {};
-            }],
-          }],
-          PostToolUse: [{
-            hooks: [async (input) => {
-              const toolEvent = input as PostToolUseHookInput;
-              console.log('[claude-client] PostToolUse:', toolEvent.tool_name, 'id:', toolEvent.tool_use_id);
-              controller.enqueue(formatSSE({
-                type: 'tool_result',
-                data: JSON.stringify({
-                  tool_use_id: toolEvent.tool_use_id,
-                  content: typeof toolEvent.tool_response === 'string'
-                    ? toolEvent.tool_response
-                    : JSON.stringify(toolEvent.tool_response),
-                  is_error: false,
-                }),
-              }));
-
-              // Detect TodoWrite tool and emit task_update SSE for frontend sync
-              if (toolEvent.tool_name === 'TodoWrite') {
-                try {
-                  // SDK TodoWriteInput: { todos: { content, status, activeForm }[] }
-                  const toolInput = toolEvent.tool_input as {
-                    todos?: Array<{ content: string; status: string; activeForm?: string }>;
-                  };
-                  if (toolInput?.todos && Array.isArray(toolInput.todos)) {
-                    console.log('[claude-client] TodoWrite detected, syncing', toolInput.todos.length, 'tasks');
-                    controller.enqueue(formatSSE({
-                      type: 'task_update',
-                      data: JSON.stringify({
-                        session_id: sessionId,
-                        todos: toolInput.todos.map((t, i) => ({
-                          id: String(i),
-                          content: t.content,
-                          status: t.status,
-                          activeForm: t.activeForm || '',
-                        })),
-                      }),
-                    }));
-                  }
-                } catch (e) {
-                  console.warn('[claude-client] Failed to parse TodoWrite input:', e);
-                }
-              }
-
-              return {};
-            }],
-          }],
-        };
+        // No queryOptions.hooks — all hook types (Notification, PostToolUse) use
+        // the SDK's hook_callback control_request transport, which fails with
+        // "CLI output was not valid JSON" when the CLI mixes control frames with
+        // normal stdout. Notifications are derived from stream messages instead
+        // (task_notification, result). TodoWrite sync uses tool_use → tool_result.
 
         // Capture real-time stderr output from Claude Code process
         queryOptions.stderr = (data: string) => {
@@ -762,13 +666,15 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
 
         // Fire-and-forget: capture SDK capabilities for UI consumption
         // Scope to provider so different providers don't pollute each other's cache
-        const capProviderId = activeProvider?.api_key ? (options.provider as ApiProvider & { id?: string })?.id || 'custom' : 'env';
+        const capProviderId = resolved.provider?.api_key ? resolved.provider.id || 'custom' : 'env';
         captureCapabilities(sessionId, conversation, capProviderId).catch((err) => {
           console.warn('[claude-client] Capability capture failed:', err);
         });
 
         let lastAssistantText = '';
         let tokenUsage: TokenUsage | null = null;
+        // Track pending TodoWrite tool_use_ids so we can sync after successful execution
+        const pendingTodoWrites = new Map<string, Array<{ content: string; status: string; activeForm?: string }>>();
 
         for await (const message of conversation) {
           if (abortController?.signal.aborted) {
@@ -796,6 +702,20 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
                       input: block.input,
                     }),
                   }));
+
+                  // Track TodoWrite calls — sync deferred until tool_result confirms success
+                  if (block.name === 'TodoWrite') {
+                    try {
+                      const toolInput = block.input as {
+                        todos?: Array<{ content: string; status: string; activeForm?: string }>;
+                      };
+                      if (toolInput?.todos && Array.isArray(toolInput.todos)) {
+                        pendingTodoWrites.set(block.id, toolInput.todos);
+                      }
+                    } catch (e) {
+                      console.warn('[claude-client] Failed to parse TodoWrite input:', e);
+                    }
+                  }
                 }
               }
               break;
@@ -824,6 +744,24 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
                         is_error: block.is_error || false,
                       }),
                     }));
+
+                    // Deferred TodoWrite sync: only emit task_update after successful execution
+                    if (!block.is_error && pendingTodoWrites.has(block.tool_use_id)) {
+                      const todos = pendingTodoWrites.get(block.tool_use_id)!;
+                      pendingTodoWrites.delete(block.tool_use_id);
+                      controller.enqueue(formatSSE({
+                        type: 'task_update',
+                        data: JSON.stringify({
+                          session_id: sessionId,
+                          todos: todos.map((t, i) => ({
+                            id: String(i),
+                            content: t.content,
+                            status: t.status,
+                            activeForm: t.activeForm || '',
+                          })),
+                        }),
+                      }));
+                    }
                   }
                 }
               }
@@ -860,6 +798,7 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
               const sysMsg = message as SDKSystemMessage;
               if ('subtype' in sysMsg) {
                 if (sysMsg.subtype === 'init') {
+                  const initMsg = sysMsg as SDKSystemMessage & { slash_commands?: unknown; skills?: unknown };
                   controller.enqueue(formatSSE({
                     type: 'status',
                     data: JSON.stringify({
@@ -867,6 +806,8 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
                       model: sysMsg.model,
                       requested_model: model,
                       tools: sysMsg.tools,
+                      slash_commands: initMsg.slash_commands,
+                      skills: initMsg.skills,
                     }),
                   }));
                 } else if (sysMsg.subtype === 'status') {
@@ -878,6 +819,21 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
                       data: statusMsg.permissionMode,
                     }));
                   }
+                } else if (sysMsg.subtype === 'task_notification') {
+                  // Agent task completed/failed/stopped — surface as notification
+                  const taskMsg = sysMsg as SDKSystemMessage & {
+                    status: string; summary: string; task_id: string;
+                  };
+                  const title = taskMsg.status === 'completed' ? 'Task completed' : `Task ${taskMsg.status}`;
+                  controller.enqueue(formatSSE({
+                    type: 'status',
+                    data: JSON.stringify({
+                      notification: true,
+                      title,
+                      message: taskMsg.summary || '',
+                    }),
+                  }));
+                  notifyGeneric(title, taskMsg.summary || '', telegramOpts).catch(() => {});
                 }
               }
               break;
@@ -922,6 +878,16 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
                   session_id: resultMsg.session_id,
                 }),
               }));
+              // Notify on conversation-level errors (e.g. rate limit, auth failure)
+              if (resultMsg.is_error) {
+                const errTitle = 'Conversation error';
+                const errMsg = resultMsg.subtype || 'The conversation ended with an error';
+                controller.enqueue(formatSSE({
+                  type: 'status',
+                  data: JSON.stringify({ notification: true, title: errTitle, message: errMsg }),
+                }));
+                notifyGeneric(errTitle, errMsg, telegramOpts).catch(() => {});
+              }
               break;
             }
 
@@ -960,19 +926,19 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
           if (code === 'ENOENT' || rawMessage.includes('ENOENT') || rawMessage.includes('spawn')) {
             errorMessage = `Claude Code CLI not found. Please ensure Claude Code is installed and available in your PATH.\n\nOriginal error: ${rawMessage}`;
           } else if (rawMessage.includes('exited with code 1') || rawMessage.includes('exit code 1')) {
-            const providerHint = activeProvider?.name ? ` (Provider: ${activeProvider.name})` : '';
+            const providerHint = resolved.provider?.name ? ` (Provider: ${resolved.provider?.name})` : '';
             const detailHint = extraDetail ? `\n\nDetails: ${extraDetail}` : '';
             const hasImages = files && files.some(f => isImageFile(f.type));
             const imageHint = hasImages ? '\n• Provider may not support image/vision input' : '';
             errorMessage = `Claude Code process exited with an error${providerHint}. This is often caused by:\n• Invalid or missing API Key\n• Incorrect Base URL configuration\n• Network connectivity issues${imageHint}${detailHint}\n\nOriginal error: ${rawMessage}`;
           } else if (rawMessage.includes('exited with code')) {
-            const providerHint = activeProvider?.name ? ` (Provider: ${activeProvider.name})` : '';
+            const providerHint = resolved.provider?.name ? ` (Provider: ${resolved.provider?.name})` : '';
             errorMessage = `Claude Code process crashed unexpectedly${providerHint}.\n\nOriginal error: ${rawMessage}`;
           } else if (code === 'ECONNREFUSED' || rawMessage.includes('ECONNREFUSED') || rawMessage.includes('fetch failed')) {
-            const baseUrl = activeProvider?.base_url || 'default';
+            const baseUrl = resolved.provider?.base_url || 'default';
             errorMessage = `Cannot connect to API endpoint (${baseUrl}). Please check your network connection and Base URL configuration.\n\nOriginal error: ${rawMessage}`;
           } else if (rawMessage.includes('401') || rawMessage.includes('Unauthorized') || rawMessage.includes('authentication')) {
-            const providerHint = activeProvider?.name ? ` for provider "${activeProvider.name}"` : '';
+            const providerHint = resolved.provider?.name ? ` for provider "${resolved.provider?.name}"` : '';
             errorMessage = `Authentication failed${providerHint}. Please verify your API Key is correct and has not expired.\n\nOriginal error: ${rawMessage}`;
           } else if (rawMessage.includes('403') || rawMessage.includes('Forbidden')) {
             errorMessage = `Access denied. Your API Key may not have permission for this operation.\n\nOriginal error: ${rawMessage}`;
